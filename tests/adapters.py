@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import os
+
+import regex as re
+from collections import Counter
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
+
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
+from tests.toolFun.Tokenizer import get_stats, merge_ids
+from tests.toolFun.Tokenizer import BPETokenizer
 
 def run_linear(
     d_in: int,
@@ -540,53 +546,99 @@ def run_load_checkpoint(
 
 
 def get_tokenizer(
-    vocab: dict[int, bytes],
-    merges: list[tuple[bytes, bytes]],
-    special_tokens: list[str] | None = None,
-) -> Any:
-    """Given a vocabulary, a list of merges, and a list of special tokens,
-    return a BPE tokenizer that uses the provided vocab, merges, and special tokens.
+    vocab: dict[int, bytes],#分词器词汇表，一个从 int（词汇表中标记的 ID）到 bytes（标记字节）的映射
+    merges: list[tuple[bytes, bytes]],#BPE 合并列表。列表中的每个元素都是一个字节元组 (<token1>, <token2>)，
+    special_tokens: list[str] | None = None,#分词器使用的特殊字符串标记列表。这些字符串永远不会被拆分成多个标记，始终保持为一个标记。
+) -> Any:#一个使用提供的词汇表、合并列表和特殊标记的 BPE 分词器。
+    # 实例化上面的类
+    tokenizer = BPETokenizer(vocab, merges, special_tokens)
 
-    Args:
-        vocab (dict[int, bytes]): The tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
-            to bytes (token bytes)
-        merges (list[tuple[bytes, bytes]]): BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
-            representing that <token1> was merged with <token2>.
-            Merges are ordered by order of creation.
-        special_tokens (list[str] | None): A list of string special tokens for the tokenizer. These strings will never
-            be split into multiple tokens, and will always be kept as a single token.
-
-    Returns:
-        A BPE tokenizer that uses the provided vocab, merges, and special tokens.
-    """
-    raise NotImplementedError
+    # 返回这个实例
+    return tokenizer
 
 
 def run_train_bpe(
-    input_path: str | os.PathLike,
-    vocab_size: int,
-    special_tokens: list[str],
+    input_path: str | os.PathLike, #str 包含 BPE 分词器训练数据的文本文件的路径。
+    vocab_size: int,    #一个正整数，定义最大最终词汇表大小（包括初始字节词汇表、合并生成的词汇项以及任何特殊标记）。
+    special_tokens: list[str],#要添加到词汇表的字符串列表
     **kwargs,
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """Given the path to an input corpus, run train a BPE tokenizer and
-    output its vocabulary and merges.
+) -> tuple[ dict[int, bytes], list[tuple[bytes, bytes]] ]:
+    #dict[int, bytes] 分词器词汇表，从 int（词汇表中的分词 ID）到 bytes（分词字节）的映射。
+    #训练生成的 BPE 合并列表。每个列表项都是一个字节元组 (<token1>, <token2>)，表示 <token1> 已与 <token2> 合并。合并应按创建顺序排序。
+    # 1. 读取文本并转换为字节 ID 列表
+    with open(input_path, "r",encoding='utf-8') as f:
+        text = f.read()
 
-    Args:
-        input_path (str | os.PathLike): Path to BPE tokenizer training data.
-        vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
-        special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
-            These strings will never be split into multiple tokens, and will always be
-            kept as a single token. If these special tokens occur in the `input_path`,
-            they are treated as any other string.
+        """
+        改进：预处理特殊字符，若有特殊字符，按照特殊字符切分为多段
+        """
+    if special_tokens:
+        # 对特殊字符进行转义（如 | -> \|），并用 | 连接成正则
+        # 结果类似: "\<\|endoftext\|\>|\<\|pad\|\>"
+        pattern = "|".join(re.escape(tok) for tok in special_tokens)
+        text_segments = re.split(pattern, text)
+    else:
+        text_segments = [text]
+        #使用GPT - 2风格的正则进行预分词
+        # 这会将文本拆分为单词列表，例如 ["The", " world", " is", ...]
+    PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+    #统计单词出现的频次
+    vocab_counts = Counter()
+    for text in text_segments:
+        #根据特殊字符切分后的各个语句统计单词
+        if not text:continue
+        #对片段进行切分
+        words = re.findall(PAT, text)
+        #统计单词内的频率
+        for word in words:
+            word_bytes = tuple(word.encode("utf-8"))
+            vocab_counts[word_bytes] += 1
+        #初始化基础词表
+    vocab = {idx: bytes([idx]) for idx in range(256)}
+     #预留合并的词表个数
+    merges_num = vocab_size - 256 - len(special_tokens)
+    merges_indices = []
+    #主循环
+    for i in range (merges_num):
+        stats = get_stats(vocab_counts)
+        if not stats:
+            break
+        # 找到频率最高的 pair；同频时按 GPT-2 约定用字节字典序断序 (vocab[p[0]], vocab[p[1]])
+        max_pair = max(stats, key=lambda p: (stats[p], vocab[p[0]], vocab[p[1]]))
+        merges_indices.append(max_pair)
+        new_id = 256 + i
+        vocab[new_id] = vocab[max_pair[0]] + vocab[max_pair[1]]
+        vocab_counts = merge_ids(vocab_counts,max_pair,new_id)
+    #后处理，将特殊字符放入词表
+    current_idx = 256 + len(merges_indices)
+    for token in special_tokens:
+        vocab[current_idx] = token.encode("utf-8")
+        current_idx += 1
+    #格式化输出
+    final_merges = []
+    for p0,p1 in merges_indices:
+        final_merges.append((vocab[p0], vocab[p1]))
+    return vocab, final_merges
 
-    Returns:
-        tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-            vocab:
-                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
-                to bytes (token bytes)
-            merges:
-                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
-                representing that <token1> was merged with <token2>.
-                Merges are ordered by order of creation.
-    """
-    raise NotImplementedError
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
