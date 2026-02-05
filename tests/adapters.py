@@ -12,15 +12,17 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from torch.nn import Module
 
-from tests.toolFun.Tokenizer import get_stats, merge_ids
-from tests.toolFun.Tokenizer import BPETokenizer
+from tests.toolFun.Tokenizer import get_stats, merge_ids,BPETokenizer
+from tests.toolFun.transformer import Linear, Embedding, RMSNorm, SwiGLU, MultiHeadAttention, Rope, DotAttention
+
 
 def run_linear(
-    d_in: int,
-    d_out: int,
-    weights: Float[Tensor, " d_out d_in"],
-    in_features: Float[Tensor, " ... d_in"],
+    d_in: int,#输入维度的大小
+    d_out: int,#输出维度的大小
+    weights: Float[Tensor, " d_out d_in"],#要使用的线性权重
+    in_features: Float[Tensor, " ... d_in"],#要应用该函数的输出张量
 ) -> Float[Tensor, " ... d_out"]:
     """
     Given the weights of a Linear layer, compute the transformation of a batched input.
@@ -34,15 +36,25 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
+    # 1. 检查维度是否匹配（可选，但推荐）
+    assert weights.shape == (d_out, d_in)
+    assert in_features.shape[-1] == d_in
+    liner = Linear(d_in,d_out)
+    # 这里的 key "W" 必须对应你在 __init__ 中 self.W = ... 的名字
+    state_dict = {"W": weights}
+    # 3. 加载权重
+    # strict=True (默认) 会检查名字是否完全匹配，多一个少一个都会报错
+    liner.load_state_dict(state_dict)
 
-    raise NotImplementedError
+    return liner.forward(in_features)
+
 
 
 def run_embedding(
-    vocab_size: int,
+    vocab_size: int,#词汇表中嵌入向量的数量
     d_model: int,
-    weights: Float[Tensor, " vocab_size d_model"],
-    token_ids: Int[Tensor, " ..."],
+    weights: Float[Tensor, " vocab_size d_model"],#要从中获取的嵌入向量
+    token_ids: Int[Tensor, " ..."],#要从嵌入层获取的词元 ID 集合
 ) -> Float[Tensor, " ... d_model"]:
     """
     Given the weights of an Embedding layer, get the embeddings for a batch of token ids.
@@ -56,40 +68,25 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
+    enbeding = Embedding(vocab_size, d_model)
+    state = {"embed_table":weights}
+    enbeding.load_state_dict(state)
+    return enbeding.forward(token_ids)
 
 
 def run_swiglu(
-    d_model: int,
-    d_ff: int,
-    w1_weight: Float[Tensor, " d_ff d_model"],
-    w2_weight: Float[Tensor, " d_model d_ff"],
-    w3_weight: Float[Tensor, " d_ff d_model"],
-    in_features: Float[Tensor, " ... d_model"],
+    d_model: int,#前馈输入和输出的维度
+        d_ff: int,#SwiGLU 网络内部上投影的维度。
+    w1_weight: Float[Tensor, " d_ff d_model"],#存储的 W1 权重,门控投影 。负责把输入映射到高维，并经过激活函数。它决定了“让多少信息通过”。
+    w2_weight: Float[Tensor, " d_model d_ff"],#上投影 。负责把输入映射到高维，但不进行激活（或者是线性的）。它包含了主要的信息内容。
+    w3_weight: Float[Tensor, " d_ff d_model"],#下投影.负责把处理好的高维特征，重新压缩回原来的维度 d_model
+    in_features: Float[Tensor, " ... d_model"],#前馈层的输入嵌入。
 ) -> Float[Tensor, " ... d_model"]:
-    """Given the weights of a SwiGLU network, return
-    the output of your implementation with these weights.
 
-    Args:
-        d_model (int): Dimensionality of the feedforward input and output.
-        d_ff (int): Dimensionality of the up-project happening internally to your swiglu.
-        w1_weight (Float[Tensor, "d_ff d_model"]): Stored weights for W1
-        w2_weight (Float[Tensor, "d_model d_ff"]): Stored weights for W2
-        w3_weight (Float[Tensor, "d_ff d_model"]): Stored weights for W3
-        in_features (Float[Tensor, "... d_model"]): Input embeddings to the feed-forward layer.
-
-    Returns:
-        Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
-    """
-    # Example:
-    # If your state dict keys match, you can use `load_state_dict()`
-    # swiglu.load_state_dict(weights)
-    # You can also manually assign the weights
-    # swiglu.w1.weight.data = w1_weight
-    # swiglu.w2.weight.data = w2_weight
-    # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    swiglu = SwiGLU(d_model,d_ff)
+    state = {"W1":w1_weight,"W2":w2_weight,"W3":w3_weight}
+    swiglu.load_state_dict(state)
+    return swiglu.forward(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -122,29 +119,17 @@ def run_multihead_self_attention(
     o_proj_weight: Float[Tensor, " d_model d_v"],
     in_features: Float[Tensor, " ... sequence_length d_in"],
 ) -> Float[Tensor, " ... sequence_length d_out"]:
-    """
-    Given the key, query, and value projection weights of a naive unbatched
-    implementation of multi-head attention, return the output of an optimized batched
-    implementation. This implementation should handle the key, query, and value projections
-    for all heads in a single matrix multiply.
-    This function should not use RoPE.
-    See section 3.2.2 of Vaswani et al., 2017.
 
-    Args:
-        d_model (int): Dimensionality of the feedforward input and output.
-        num_heads (int): Number of heads to use in multi-headed attention.
-        max_seq_len (int): Maximum sequence length to pre-cache if your implementation does that.
-        q_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the Q projection
-        k_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the K projection
-        v_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the V projection
-        o_proj_weight (Float[Tensor, "d_model d_v"]): Weights for the output projection
-        in_features (Float[Tensor, "... sequence_length d_in"]): Tensor to run your implementation on.
-
-    Returns:
-        Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
-        implementation with the given QKV projection weights and input features.
-    """
-    raise NotImplementedError
+    mult_atten = MultiHeadAttention(d_model,num_heads)
+    # PyTorch Linear 权重为 (out, in)，计算为 x @ weight.T；本实现用 x @ w，故需加载 weight.T
+    state = {
+        "wq": q_proj_weight.T,
+        "wk": k_proj_weight.T,
+        "wv": v_proj_weight.T,
+        "out_proj": o_proj_weight.T,
+    }
+    mult_atten.load_state_dict(state)
+    return mult_atten.forward(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -184,8 +169,32 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
-
+    B,T,D = in_features.shape
+    assert d_model % num_heads == 0,"d_model must be divisible by num_heads"
+    head_dim = d_model // num_heads
+    # 1. 初始化 RoPE 模块
+    # 注意：这里的 d_k 是 head_dim
+    rope_module = Rope(theta=theta, d_k=head_dim, max_seq_len=max_seq_len)
+    #投影qkv
+    q = in_features @ q_proj_weight.T
+    k = in_features @ k_proj_weight.T
+    v = in_features @ v_proj_weight.T
+    #将d_model拆分为head_dim * heads并转置
+    q = q.view(B,T,num_heads,head_dim).transpose(1, 2)
+    k = k.view(B,T,num_heads,head_dim).transpose(1, 2)
+    v = v.view(B,T,num_heads,head_dim).transpose(1, 2)
+    #关键插入点：旋转 (Apply RoPE)
+    # 6. 🔴 应用 RoPE
+    # 注意：RoPE 类通常需要处理 Heads 维度广播，确保你的 RoPE forward 支持 [Batch, Heads, Seq, Dim] 输入
+    q_rope = rope_module.forward(q,token_positions)
+    k_rope = rope_module.forward(k,token_positions)
+    # 7. 计算注意力 (Scaled Dot-Product)
+    # 使用旋转后的 q_rot 和 k_rot
+    # Score: [Batch, Heads, Seq, Seq]
+    attn_score  =DotAttention().forward(q_rope,k_rope,v)
+    out = attn_score.transpose(1,2).contiguous()
+    out = out.view(B,T,d_model)
+    return out @ o_proj_weight.T
 
 def run_rope(
     d_k: int,
@@ -206,7 +215,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    rope = Rope(theta=theta, d_k=d_k, max_seq_len=max_seq_len)
+    return rope.forward(in_query_or_key,token_positions)
 
 
 def run_transformer_block(
@@ -384,7 +394,10 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    rms = RMSNorm(d_model, eps)
+    state = {"weights":weights}
+    rms.load_state_dict(state)
+    return rms.forward(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
