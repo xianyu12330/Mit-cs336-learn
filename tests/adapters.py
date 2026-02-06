@@ -336,99 +336,49 @@ d_ff (int)：前馈内层的维度（参见 3.3 节）。
 rope_theta (float)：RoPE 的 Theta 参数。
 
 weights (dict[str, Tensor])：
-
 参考实现的状态字典。 {num_layers} 指的是一个介于 0 和 num_layers - 1 之间的整数（层索引）。
-
 此字典的键如下：
-
 - `token_embeddings.weight`
-
 词元嵌入矩阵。形状为 (vocab_size, d_model)。
 
 - `layers.{num_layers}.attn.q_proj.weight`
-
-所有 `num_heads` 个注意力头的查询投影。
-
-形状为 (num_heads * (d_model / num_heads), d_model)。
-
-行按形状为 (num_heads, d_k) 的矩阵排序，
-
+所有 `num_heads` 个注意力头的查询投影。形状为 (num_heads * (d_model / num_heads), d_model)。行按形状为 (num_heads, d_k) 的矩阵排序，
 因此 `attn.q_proj.weight == torch.cat([q_heads.0.weight, ..., q_heads.N.weight], dim=0)`。
 
 - `layers.{num_layers}.attn.k_proj.weight`
-
-所有 `num_heads` 个注意力头的键投影。
-
-形状为 (num_heads * (d_model / num_heads), d_model)。
-
-行按形状为 (num_heads, d_k) 的矩阵排序，
-
+所有 `num_heads` 个注意力头的键投影。形状为 (num_heads * (d_model / num_heads), d_model)。行按形状为 (num_heads, d_k) 的矩阵排序，
 因此 `attn.k_proj.weight == torch.cat([k_heads.0.weight, ..., k_heads.N.weight], dim=0)`。
 
 - `layers.{num_layers}.attn.v_proj.weight`
-
-所有 `num_heads` 个注意力头的权重值投影。
-
-形状为 (num_heads * (d_model / num_heads), d_model)。
-
-行按形状为 (num_heads, d_v) 的矩阵排序，
-
+所有 `num_heads` 个注意力头的权重值投影。形状为 (num_heads * (d_model / num_heads), d_model)。行按形状为 (num_heads, d_v) 的矩阵排序，
 因此 `attn.v_proj.weight == torch.cat([v_heads.0.weight, ..., v_heads.N.weight], dim=0)`。
 
 - `layers.{num_layers}.attn.output_proj.weight`
-
-多头自注意力输出投影的权重
-
-形状为 ((d_model / num_heads) * num_heads, d_model)。
+多头自注意力输出投影的权重形状为 ((d_model / num_heads) * num_heads, d_model)。
 
 - `layers.{num_layers}.ln1.weight`
-
-Transformer 模块中第一个 RMSNorm 的仿射变换权重
-
-形状为 (d_model,)。
+Transformer 模块中第一个 RMSNorm 的仿射变换权重形状为 (d_model,)。
 
 - `layers.{num_layers}.ffn.w1.weight`
-
-前馈神经网络 (FFN) 中第一个线性变换的权重。
-
-形状为 (d_model, d_ff)。
+前馈神经网络 (FFN) 中第一个线性变换的权重。形状为 (d_model, d_ff)。
 
 - `layers.{num_layers}.ffn.w2.weight`
-
-前馈神经网络 (FFN) 中第二个线性变换的权重。
-
-形状为 (d_ff, d_model)。
+前馈神经网络 (FFN) 中第二个线性变换的权重。形状为 (d_ff, d_model)。
 
 - `layers.{num_layers}.ffn.w3.weight`
-
-前馈神经网络 (FFN) 中第三个线性变换的权重。
-
-形状为 (d_model, d_ff）。
+前馈神经网络 (FFN) 中第三个线性变换的权重。形状为 (d_model, d_ff）。
 
 - `layers.{num_layers}.ln2.weight`
-
-第二个 RMSNorm 变换的仿射权重
-
-应用于 Transformer 模块。
-
-形状为 (d_model,)。
+第二个 RMSNorm 变换的仿射权重应用于 Transformer 模块。形状为 (d_model,)。
 
 - `ln_final.weight`
-
-应用于最终 Transformer 模块输出的 RMSNorm 变换的仿射权重。
-
-形状为 (d_model,)。
+应用于最终 Transformer 模块输出的 RMSNorm 变换的仿射权重。形状为 (d_model,)。
 
 - `lm_head.weight`
-
-语言模型输出嵌入的权重。
-
-形状为 (vocab_size, d_model)。
-
+语言模型输出嵌入的权重。形状为 (vocab_size, d_model)。
 in_indices (Int[Tensor, "batch_size sequence_length"]) 用于运行语言模型的输入索引张量。形状为 (batch_size, sequence_length)，其中
 
 `sequence_length` 至多为 `context_length`。
-
 返回值：
 
 Float[Tensor, "batch_size sequence_length vocab_size"]: 包含每个词元预测的未归一化
@@ -436,7 +386,7 @@ Float[Tensor, "batch_size sequence_length vocab_size"]: 包含每个词元预测
 下一个词分布的张量。
 
 """
-    """
+
     raise NotImplementedError
 
 
