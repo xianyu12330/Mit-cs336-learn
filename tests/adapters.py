@@ -16,6 +16,7 @@ from torch.nn import Module
 
 from tests.toolFun.Tokenizer import get_stats, merge_ids,BPETokenizer
 from tests.toolFun.transformer import Linear, Embedding, RMSNorm, SwiGLU, MultiHeadAttention, Rope, DotAttention
+from tests.toolFun.Optimizer import Adamw,Cosine,GradientClip
 
 
 def run_linear(
@@ -470,7 +471,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
 
 
 def run_cross_entropy(
-    inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
+    inputs: Float[Tensor, " batch_size vocab_size"], #inputs[i][j] 是第 i 个样本的第 j 个类别的未归一化 logit 值
+    targets: Int[Tensor, " batch_size"]#形状为 (batch_size,) 的张量，包含正确类别的索引
 ) -> Float[Tensor, ""]:
     """Given a tensor of inputs and targets, compute the average cross-entropy
     loss across examples.
@@ -484,7 +486,38 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    batch_size = inputs.shape[0]
+    # 沿着dim = 1找到最大
+    #使用 .values 获取数值，使用 keepdim=True 保持形状为 (batch_size, 1) 以便广播
+    line_max = inputs.max(dim=1,keepdim=True).values
+    # Exp & Sum: (inputs - max).exp().sum(dim=1).log()
+    # (B, V) - (B, 1) -> (B, V) -> sum -> (B,) -> log -> (B,)
+    exp_sum = (inputs - line_max).exp().sum(dim=1).log()
+    # Restore: 加上刚才减去的 max，得到完整的 Log-Sum-Exp。
+    # 修正点：line_max 是 (B, 1)，exp_sum_log 是 (B,)。
+    log_sum_exp = exp_sum + line_max.squeeze(1)
+    # 4. 获取目标类别的 Logits (分子部分)
+    # 使用高级索引 (Advanced Indexing)
+    # inputs[i, targets[i]] 取出每个样本对应真实标签的 logit
+    # torch.arange(batch_size) 生成 [0, 1, ..., batch-1]
+    """
+    inputs[row_index:Tensor, col_index:Tensor]
+    那么 PyTorch 的规则是：逐元素配对索引
+    inputs[row_index[i], col_index[i]]   for each i
+    row_index = torch.arange(batch_size)  # [0, 1, 2]
+    col_index = targets                   # [2, 3, 4]  ====>target_logits = tensor([
+    inputs[0, 2],   # sample 0 的真实类别 logit
+    inputs[1, 3],   # sample 1 的真实类别 logit
+    inputs[2, 4],   # sample 2 的真实类别 logit
+])
+
+    """
+    target_logits = inputs[torch.arange(batch_size), targets]
+    # 5. 计算损失并求平均
+    # Loss = LSE - Target_Logit
+    losses = log_sum_exp - target_logits
+    return torch.mean(losses)
+
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -496,22 +529,23 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    GradientClip(parameters,max_l2_norm).__call__()
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return Adamw
+
 
 
 def run_get_lr_cosine_schedule(
-    it: int,
-    max_learning_rate: float,
-    min_learning_rate: float,
-    warmup_iters: int,
-    cosine_cycle_iters: int,
+    it: int,#要获取学习率的迭代次数
+    max_learning_rate: float,#余弦学习率策略（带预热）的最大学习率
+    min_learning_rate: float,#余弦学习率策略（带预热）的最小/最终学习率
+    warmup_iters: int,#线性预热学习率所需的迭代次数
+    cosine_cycle_iters: int,#余弦退火迭代次数
 ):
     """
     Given the parameters of a cosine learning rate decay schedule (with linear
@@ -531,7 +565,8 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    cosine = Cosine(max_learning_rate, min_learning_rate,warmup_iters, cosine_cycle_iters)
+    return cosine.__call__(it)
 
 
 def run_save_checkpoint(

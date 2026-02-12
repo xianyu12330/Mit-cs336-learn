@@ -1,7 +1,7 @@
 import collections
 from typing import List, Tuple, Dict
 import regex as re
-from collections import Counter
+from collections.abc import Iterable
 
 
 def get_stats(vocab_counts: Dict[Tuple[int, ...], int]) -> Dict[Tuple[int, int], int]:
@@ -49,127 +49,115 @@ def merge_ids(vocab_counts: Dict[Tuple[int, ...], int], pair:Tuple[int,int], idx
 
 
 class BPETokenizer:
-    #初始化
-    def __init__(self, vocab:dict[int, bytes],#分词器词汇表，一个从 int（词汇表中标记的 ID）到 bytes（标记字节）的映射
-                 merges:list[tuple[bytes, bytes]],#BPE 合并列表。列表中的每个元素都是一个字节元组 (<token1>, <token2>)，
-                 special_tokens:list[str] | None = None #分词器使用的特殊字符串标记列表。这些字符串永远不会被拆分成多个标记，始终保持为一个标记。
+    def __init__(self, vocab: dict[int, bytes],  ##分词器词汇表，一个从 int（词汇表中标记的 ID）到 bytes（标记字节）的映射
+                 merges: list[tuple[bytes, bytes]],  ##BPE 合并列表。列表中的每个元素都是一个字节元组 (<token1>, <token2>)，
+                 special_tokens: list[str] | None = None  ##分词器使用的特殊字符串标记列表。这些字符串永远不会被拆分成多个标记，始终保持为一个标记。
                  ):
-        self.vocab = vocab.copy()
-        #反向编码表：bytes标记字节-》词汇表id的映射
-        self.vocab_encoder = {} #dict[bytes,int]
-        for key,value in vocab.items():
-            self.vocab_encoder[value] = key
-        #2.处理特殊字符
-        #需要更新 vocab 和 vocab_encoder，为特殊标记分配新 ID
-        self.special_tokens = special_tokens if special_tokens  else []
-        sorted_vocab = sorted(vocab.keys())
-        #找到当前最大的id号，后续进行追加
+        # 建立正向词汇表 (self.vocab)：将传入的 vocab 复制一份保存，用于 decode。
+        self.vocab = vocab
+        # 建立反向词汇表 (self.id_to_token)：创建一个从 ID 到 token 的映射，用于 encode。
+        self.encode_vocab = {v: k for k, v in vocab.items()}
+        # 处理特殊标记 (special_tokens)：
+        # 如果不为空，遍历 special_tokens。检查每个特殊标记是否已经在 vocab 中。如果不在，计算一个新的 ID（当前最大 ID + 1），将其编码为 bytes 后加入 self.vocab。
+        self.special_tokens = special_tokens if special_tokens else []
+        sorted_vocab = sorted(vocab.keys())  # 获取 vocab 中的 ID 并排序
+        # 找到当前最大的id号，后续进行追加
         max_id = sorted_vocab[-1] if sorted_vocab else 0
-
-        for st in special_tokens:
-            # 将特殊标记转为 bytes 处理 (假设输入是 utf-8)
-            st_bytes = st.encode("utf-8")
-            #判断特殊字符的比特是否存在，不存在则新添加
-            if st_bytes not in self.vocab_encoder:
-                self.vocab_encoder[max_id] = st_bytes
-                # 同时更新正向 vocab
-                vocab[max_id] = st_bytes
+        for token in self.special_tokens:
+            # 将特殊字符转为bytes
+            st_bytes = token.encode('utf-8')
+            if st_bytes not in self.encode_vocab:
                 max_id += 1
-        #构建bpe合成规则
-        # 我们需要将 merges 里的 (bytes, bytes) 转换为 (int, int) -> (rank, new_id)
+                self.vocab[max_id] = st_bytes
+                self.encode_vocab[st_bytes] = max_id
+        # 建立 BPE 合并规则表 (self.bpe_ranks)：
+        # 我们需要将其转换为一个字典：{(bytes1, bytes2): rank}。
         self.bpe_ranks = {}
-        for rank,(p1_bytes,p2_bytes) in enumerate(merges):
-            # 核心修正：将字节对转为 ID 对
-            if p2_bytes in self.vocab_encoder and p1_bytes in self.vocab_encoder:
-                p1_id =  self.vocab_encoder[p2_bytes]
-                p2_id = self.vocab_encoder[p1_bytes]
-                merge_bytes = p1_bytes + p2_bytes
-                # 还需要找到这两个合并后变成了什么 ID
-                if merge_bytes  in self.vocab_encoder:
-                    new_id = self.vocab_encoder[merge_bytes]
+        for rank, (p1_bytes, p2_bytes) in enumerate(merges):
+            # 还需要找到这两个合并后变成了什么 ID
+            merges_bytes = p1_bytes + p2_bytes
+            if merges_bytes in self.encode_vocab:
+                new_id = self.encode_vocab[merges_bytes]
                 # 存入字典：键是 (id1, id2)，值是 (rank, new_id)
                 # 这样我们在 bpe_ 阶段既能比较优先级，又能直接拿到替换的 ID
-                    self.bpe_ranks[(p1_id,p2_id)] = (rank,new_id)
+                self.bpe_ranks[(p1_bytes, p2_bytes)] = (rank, new_id)
+    #作用是从磁盘读取训练好的模型文件，并“组装”成 __init__ 需要的参数格式，最后返回一个 Tokenizer 实例。
+    # def from_files(cls, vocab_filepath: str, #vocab的文件路径
+    #                merges_filepath: str, #merges 的文件路径
+    #                special_tokens: list[str] | None = None):
+    # #实现迭代合并bpe,函数负责处理一段已经转换为字节 ID 列表的普通文本。
 
-    #实现迭代合并bpe,函数负责处理一段已经转换为字节 ID 列表的普通文本。
-    def bpe_(self,ids: list[int])-> list[int]:
+    def bpe_(self, ids: list[int]) -> list[int]:
         """
         对给定的 id 列表执行 BPE 合并。
         这里可以使用之前写好的 merge_ids 函数。
         """
-        #保证有至少两个字节的id能进行合并，若只有一个id则无法合并
-        while len(ids) >= 2:
-            #获取所有相邻对
-            pairs = [(ids[i],ids[i + 1]) for i in range(len(ids) - 1)]
-            #要找的是：在 self.bpe_ranks 中存在，且 rank 值最小的那个 pair
-            exiting_pair = {pair :self.bpe_ranks[pair] for pair in pairs if pair in self.bpe_ranks}
-            #如果在字典内没有该配对，说明合并该结束
-            if not exiting_pair:break
-            # 找到 rank 最小（优先级最高）的 pair
-            # min 的 key 参数用于根据字典的值（rank）来比较
-            min_pair = min(exiting_pair, key=lambda k: exiting_pair[k][0])
-            #将合并后的配对插入字典
+        # 保证有至少两个字节的id能进行合并，若只有一个id则无法合并
+        while len(ids) > 2:
+            # 生成相邻字节 ID 对的列表
+            pairs = [(ids[i], ids[i + 1]) for i in range(len(ids) - 1)]
+            # 要找的是：在 self.bpe_ranks 中存在，且 rank 值最小的那个 pair
+            exiting_pair = {pair: self.bpe_ranks[pair] for pair in pairs if pair in self.bpe_ranks}
+            # 如果在字典内没有该配对，说明合并该结束
+            if not exiting_pair:
+                break
+            min_pair = min(exiting_pair.items(), key=lambda x: x[1][0])  # x[1][0] 是 rank
+            # 将合并后的配对插入字典
             new_id = self.bpe_ranks[min_pair]
-            #替换可配对的元素
-            ids = merge_ids(ids,min_pair,new_id)
+            # 替换可配对的元素
+            ids = merge_ids(ids, min_pair, new_id)
         return ids
 
-    #将文本编码为整数id
-    def tokenize_encode(self,text:str,special_tokens:list[str] | None = None) -> List[int]:
-        # 1. 确保 special_tokens 是一个集合，方便快速查找
-        if special_tokens is None:
-            special_tokens = []
-        special_tokens_set = set(special_tokens)
-        if special_tokens :
-            # 对特殊字符进行转义（如 | -> \|），并用 | 连接成正则
-            # 结果类似: "\<\|endoftext\|\>|\<\|pad\|\>"
-            pattern ="(" "|".join(re.escape(tok) for tok in special_tokens) + ")"
+    # 将单个字符串编码为 ID 列表。
+    def encode(self, text: str) -> list[int]:
+        # 对特殊字符进行转义（如 | -> \|），并用 | 连接成正则
+        special = self.special_tokens
+        if special:
+            pattern = "(" "|".join(re.escape(tok) for tok in special_tokens) + ")"
             text_segments = re.split(pattern, text)
         else:
             text_segments = [text]
         PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
-        #存放编码后的字节
-        encode_segments = []
-        for text in text_segments:
-            #跳过空字符
-            if not text:continue
-            #如果是特殊字符，将特殊字符对应的词表id插入，因为后续id转为字符仍然需要特殊字符
-            if text in special_tokens:
-                special_encode = text.encode("utf-8")
-                if special_encode in self.vocab_encoder:
-                    encode_segments.append(self.vocab_encoder[special_encode])
-                else:
-                    print(f"Warning: Special token {text} not in vocab")
-                continue
-            #对片段进行编码
-            words = re.findall(PAT,text)
+        # 存放编码后的字节
+        encode_sequence = []
+        for segment in text_segments:
+            # 跳过空字符
+            if not text: continue
+            if segment in special:
+                encode_sequence.append(self.encode_vocab[segment.encode('utf-8')])
+            # 处理普通文本段落
+            words = re.findall(PAT, text)
             for word in words:
-                word_encoded = word.encode("utf-8")
-                # 第二步：将字节转换为整数列表 (初始 ID 序列)
-                bytes_list = list(word_encoded)
-                #词被拆分为字节序列
+                # 将单词转为字节
+                word_bytes = word.encode('utf-8')
+                # 将字节拆分为单个字节的 ID 列表
+                word_ids = list(word_encoded)
+                # 词被拆分为字节序列
                 """例
                 word = " world"
                 word_encoded = b" world"
                 bytes_list = [32, 119, 111, 114, 108, 100]
                 """
-                merge_list = self.bpe_(bytes_list)
-                encode_segments.append(merge_list)
-        return encode_segments
+                # 对该字节 ID 列表执行 BPE 合并
+                bpe_ids = self.bpe_(word_ids)
+                # 将结果添加到最终的编码序列中
+                encode_sequence.extend(bpe_ids)
+        return encode_sequence
 
-    #将整数id解码回文本
-    def tokenize_decode(self,voc_list:list[int])->str:
+    def encode_iterable(self, iterable: Iterable[str]  # 比如一个打开的文件句柄，或者一个字符串列表
+                        ) -> Iterator[int]:
+        # 遍历输入的可迭代对象
+        for text_chunk in iterable:
+            yield from (self.encode(text_chunk))
+
+    def decode(self, ids: list[int]) -> str:
         token_bytes = bytearray()
-        #拼接对应的bytes
-        for voc_id in voc_list:
-            if voc_id in self.vocab:
-                token_bytes.extend(self.vocab[voc_id])
-            else:
-                print(f"Warning: ID {voc_id} not found in vocab")
-        return token_bytes.decode("utf-8",errors="replace")
+        # 拼接对应的bytes
+        for ids_id in ids:
+            if ids_id in self.vocab:
+                token_bytes.extend(self.vocab[ids_id])
+        return token_bytes.decode("utf-8", errors="replace")
 
 
-    #返回tokenizer文本编码器
-    def get_tokenizer(vocab,merges,special_tokens = None):
-        return BPETokenizer(vocab,merges,special_tokens)
+
 
