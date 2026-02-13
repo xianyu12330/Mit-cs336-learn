@@ -159,7 +159,10 @@ class BPETokenizer:
         # 对特殊字符进行转义（如 | -> \|），并用 | 连接成正则
         special = self.special_tokens
         if special:
-            pattern = "(" "|".join(re.escape(tok) for tok in special) + ")"
+            # 长 token 优先；用捕获组使 split 结果里保留特殊 token 片段
+            #按 字符串长度从大到小排序，正则化会优先匹配短的，导致特殊token被分割
+            sorted_special = sorted(special, key=len, reverse=True)
+            pattern = "(" + "|".join(re.escape(tok) for tok in sorted_special) + ")"
             text_segments = re.split(pattern, text)
         else:
             text_segments = [text]
@@ -177,8 +180,8 @@ class BPETokenizer:
             for word in words:
                 # 将单词转为字节
                 word_bytes = word.encode('utf-8')
-                # 将字节拆分为单个字节的 ID 列表
-                word_ids = list(word_bytes)
+                # 每个字节必须用 vocab 中的 id，GPT-2 等词表里 byte 与 id 不一定相等
+                word_ids = [self.encode_vocab[bytes([b])] for b in word_bytes]
                 # 词被拆分为字节序列
                 """例
                 word = " world"
