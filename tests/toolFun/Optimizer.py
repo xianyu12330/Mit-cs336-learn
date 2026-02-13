@@ -1,6 +1,5 @@
 import math
 
-import self
 import torch
 from collections.abc import Callable, Iterable
 from typing import Optional

@@ -3,7 +3,7 @@ from typing import List, Tuple, Dict
 
 import json
 import regex as re
-from collections.abc import Iterable
+from collections.abc import Iterator,Iterable
 
 
 def get_stats(vocab_counts: Dict[Tuple[int, ...], int]) -> Dict[Tuple[int, int], int]:
@@ -83,6 +83,7 @@ class BPETokenizer:
                 # 存入字典：键是 (id1, id2)，值是 (rank, new_id)
                 # 这样我们在 bpe_ 阶段既能比较优先级，又能直接拿到替换的 ID
                 self.bpe_ranks[(p1_bytes, p2_bytes)] = (rank, new_id)
+
     #作用是从磁盘读取训练好的模型文件，并“组装”成 __init__ 需要的参数格式，最后返回一个 Tokenizer 实例。
     def from_files(cls, vocab_filepath: str, #vocab的文件路径
                    merges_filepath: str, #merges 的文件路径
@@ -138,7 +139,7 @@ class BPETokenizer:
         # 对特殊字符进行转义（如 | -> \|），并用 | 连接成正则
         special = self.special_tokens
         if special:
-            pattern = "(" "|".join(re.escape(tok) for tok in special_tokens) + ")"
+            pattern = "(" "|".join(re.escape(tok) for tok in special) + ")"
             text_segments = re.split(pattern, text)
         else:
             text_segments = [text]
@@ -156,7 +157,7 @@ class BPETokenizer:
                 # 将单词转为字节
                 word_bytes = word.encode('utf-8')
                 # 将字节拆分为单个字节的 ID 列表
-                word_ids = list(word_encoded)
+                word_ids = list(word_bytes)
                 # 词被拆分为字节序列
                 """例
                 word = " world"
