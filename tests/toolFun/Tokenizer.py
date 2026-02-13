@@ -1,5 +1,7 @@
 import collections
 from typing import List, Tuple, Dict
+
+import json
 import regex as re
 from collections.abc import Iterable
 
@@ -82,10 +84,33 @@ class BPETokenizer:
                 # 这样我们在 bpe_ 阶段既能比较优先级，又能直接拿到替换的 ID
                 self.bpe_ranks[(p1_bytes, p2_bytes)] = (rank, new_id)
     #作用是从磁盘读取训练好的模型文件，并“组装”成 __init__ 需要的参数格式，最后返回一个 Tokenizer 实例。
-    # def from_files(cls, vocab_filepath: str, #vocab的文件路径
-    #                merges_filepath: str, #merges 的文件路径
-    #                special_tokens: list[str] | None = None):
-    # #实现迭代合并bpe,函数负责处理一段已经转换为字节 ID 列表的普通文本。
+    def from_files(cls, vocab_filepath: str, #vocab的文件路径
+                   merges_filepath: str, #merges 的文件路径
+                   special_tokens: list[str] | None = None):
+    #实现迭代合并bpe,函数负责处理一段已经转换为字节 ID 列表的普通文本。
+    # --- 1. 处理 Vocab ---
+        with open(vocab_filepath,'r',encoding='utf-8') as f:
+            file_json = json.load(open(vocab_filepath))
+    #初始化空字典
+        vocab = dict()
+        for key,value in file_json.items():
+           vocab[int(key)] = value.encode('utf-8')
+        #第二步：解析 Merges 文件 (Text -> List)
+        #打开文件，按行读取
+        merge = []
+        with open(merges_filepath,'r',encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()#移除字符串开头和结尾的空白字符
+                #跳过注释或者空行
+                if not line or line.startswith('#'):
+                    continue
+                #分割字符串
+                parts = line.split()
+                if len(parts) == 2:
+                    token1 = parts[0].encode('utf-8')
+                    token2 = parts[1].encode('utf-8')
+                    merge.append((token1, token2))
+        return BPETokenizer(vocab, merge, special_tokens)
 
     def bpe_(self, ids: list[int]) -> list[int]:
         """

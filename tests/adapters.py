@@ -615,10 +615,7 @@ def get_tokenizer(
     special_tokens: list[str] | None = None,#分词器使用的特殊字符串标记列表。这些字符串永远不会被拆分成多个标记，始终保持为一个标记。
 ) -> Any:#一个使用提供的词汇表、合并列表和特殊标记的 BPE 分词器。
     # 实例化上面的类
-    tokenizer = BPETokenizer(vocab, merges, special_tokens)
-
-    # 返回这个实例
-    return tokenizer
+    return BPETokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
