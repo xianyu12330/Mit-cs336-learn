@@ -17,6 +17,7 @@ from torch.nn import Module
 from tests.toolFun.Tokenizer import get_stats, merge_ids,BPETokenizer
 from tests.toolFun.transformer import Linear, Embedding, RMSNorm, SwiGLU, MultiHeadAttention, Rope, DotAttention
 from tests.toolFun.Optimizer import Adamw,Cosine,GradientClip
+from tests.toolFun.dataLord import get_batch,save_checkpoint,load_checkpoint
 
 
 def run_linear(
@@ -322,7 +323,7 @@ def run_transformer_lm(
     d_ff: int,
     rope_theta: float,
     weights: dict[str, Tensor],
-    in_indices: Int[Tensor, " batch_size sequence_length"],
+    in_indices: Int[Tensor, " batch_size sequence_length"],#输入索引张量
 ) -> Float[Tensor, " batch_size sequence_length vocab_size"]:
     """给定 Transformer 语言模型的权重和输入索引，
 返回对输入索引进行前向传播后的输出。
@@ -387,8 +388,33 @@ Float[Tensor, "batch_size sequence_length vocab_size"]: 包含每个词元预测
 下一个词分布的张量。
 
 """
+    # Token Embedding
+    token_embeddings = run_embedding(
+        vocab_size, d_model, weights["token_embeddings.weight"], in_indices
+    )
+    x = token_embeddings
+    # 逐层跑 Transformer block，每层从 weights 里取 layers.{i}.xxx 并转成 block 需要的键名
+    for i in range(num_layers):
+        layer_prefix = f"layers.{i}."
+        block_weights = {
+            k[len(layer_prefix) :]: v
+            for k, v in weights.items()
+            if k.startswith(layer_prefix)
+        }
+        x = run_transformer_block(
+            d_model=d_model,
+            num_heads=num_heads,
+            d_ff=d_ff,
+            max_seq_len=context_length,
+            theta=rope_theta,
+            weights=block_weights,
+            in_features=x,
+        )
+    # 最后一层 RMSNorm + lm_head
+    norm_out = run_rmsnorm(d_model, 1e-5, weights["ln_final.weight"], x)
+    logits = run_linear(d_model, vocab_size, weights["lm_head.weight"], norm_out)
+    return logits
 
-    raise NotImplementedError
 
 
 def run_rmsnorm(
@@ -432,7 +458,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
 
 
 def run_get_batch(
-    dataset: npt.NDArray, #数据集中整数标记 ID 的一维 NumPy 数组。
+        dataset: npt.NDArray, #数据集中整数标记 ID 的一维 NumPy 数组。
         batch_size: int, #期望的采样批次大小
         context_length: int, #每个采样样本的期望上下文长度。
         device: str #PyTorch 设备字符串（例如，'cpu' 或 'cuda:0'），指示要放置采样输入序列和标签的设备。
@@ -454,7 +480,7 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    return get_batch(dataset, batch_size, context_length, device)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -588,7 +614,7 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    save_checkpoint(model, optimizer, iteration, out)
 
 
 def run_load_checkpoint(
@@ -609,7 +635,7 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    return load_checkpoint(src, model, optimizer)
 
 
 def get_tokenizer(
