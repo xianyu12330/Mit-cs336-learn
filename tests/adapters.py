@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 
-import regex as re
-from collections import Counter
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
@@ -14,8 +12,20 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from torch.nn import Module
 
-from tests.toolFun.Tokenizer import get_stats, merge_ids,BPETokenizer
-from tests.toolFun.transformer import Linear, Embedding, RMSNorm, SwiGLU, MultiHeadAttention, Rope, DotAttention
+from tests.toolFun.Tokenizer import get_stats, merge_ids, BPETokenizer, BPETrainer
+from tests.toolFun.transformer import (
+    Linear,
+    Embedding,
+    RMSNorm,
+    SwiGLU,
+    MultiHeadAttention,
+    Rope,
+    DotAttention,
+    MultiHeadAttentionWithRoPE,
+    TransformerBlock,
+    TransformerLM,
+    CrossEntropyLoss,
+)
 from tests.toolFun.Optimizer import Adamw,Cosine,GradientClip
 from tests.toolFun.dataLord import get_batch,save_checkpoint,load_checkpoint
 
@@ -133,7 +143,7 @@ def run_multihead_self_attention(
     mult_atten.load_state_dict(state)
     return mult_atten.forward(in_features)
 
-
+#error
 def run_multihead_self_attention_with_rope(
     d_model: int,
     num_heads: int,
@@ -171,31 +181,14 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    B,T,D = in_features.shape
-    assert d_model % num_heads == 0,"d_model must be divisible by num_heads"
-    head_dim = d_model // num_heads
-    # 1. 初始化 RoPE 模块
-    # 注意：这里的 d_k 是 head_dim
-    rope_module = Rope(theta=theta, d_k=head_dim, max_seq_len=max_seq_len)
-    #投影qkv
-    q = in_features @ q_proj_weight.T
-    k = in_features @ k_proj_weight.T
-    v = in_features @ v_proj_weight.T
-    #将d_model拆分为head_dim * heads并转置
-    q = q.view(B,T,num_heads,head_dim).transpose(1, 2)
-    k = k.view(B,T,num_heads,head_dim).transpose(1, 2)
-    v = v.view(B,T,num_heads,head_dim).transpose(1, 2)
-    #关键插入点：旋转 (Apply RoPE)
-    # 6. 🔴 应用 RoPE
-    # 注意：RoPE 类通常需要处理 Heads 维度广播，确保你的 RoPE forward 支持 [Batch, Heads, Seq, Dim] 输入
-    q_rope = rope_module.forward(q,token_positions)
-    k_rope = rope_module.forward(k,token_positions)
-    # 7. 计算注意力 (Scaled Dot-Product)，decoder-only 需因果掩码
-    causal_mask = torch.tril(torch.ones(T, T, device=in_features.device, dtype=q_rope.dtype)).view(1, 1, T, T)
-    attn_score = DotAttention().forward(q_rope, k_rope, v, mask=causal_mask)
-    out = attn_score.transpose(1,2).contiguous()
-    out = out.view(B,T,d_model)
-    return out @ o_proj_weight.T
+    mha = MultiHeadAttentionWithRoPE(d_model, num_heads, max_seq_len, theta)
+    mha.load_ref_state_dict({
+        "attn.q_proj.weight": q_proj_weight,
+        "attn.k_proj.weight": k_proj_weight,
+        "attn.v_proj.weight": v_proj_weight,
+        "attn.output_proj.weight": o_proj_weight,
+    })
+    return mha(in_features, token_positions)
 
 def run_rope(
     d_k: int,
@@ -286,32 +279,9 @@ def run_transformer_block(
     Float[Tensor, "batch sequence_length d_model"] 张量，包含使用 RoPE 对输入特征运行 Transformer 模块的输出。
 
     """
-    # 获取当前输入的实际维度
-    batch_size, seq_len, _ = in_features.shape
-    #残差链接预留
-    residual = in_features
-    # 1. 修正位置索引生成
-    # 必须使用 seq_len 而不是 max_seq_len
-    # 必须指定 device=in_features.device
-    token_pos = torch.arange(seq_len, device=in_features.device)
-    # 扩展为 [Batch, Seq] 以匹配 Attention 的输入要求
-    token_pos = token_pos.unsqueeze(0).expand(batch_size, seq_len)
-    #对输入进行RMSNorm并传入带RoPE 的多头注意力
-    normed_x1 = run_rmsnorm(d_model, eps=1e-5,weights=weights["ln1.weight"],in_features=in_features)
-    attn_out = run_multihead_self_attention_with_rope(d_model,num_heads,max_seq_len,theta,
-                                               weights["attn.q_proj.weight"],
-                                               weights["attn.k_proj.weight"],
-                                               weights["attn.v_proj.weight"],
-                                               weights["attn.output_proj.weight"],
-                                               normed_x1,token_pos)
-    #残差连接
-    x = residual + attn_out
-    residual = x
-    #第二次rmsnorm
-    normed_x2 = run_rmsnorm(d_model, eps=1e-5,weights=weights["ln2.weight"],in_features=x)
-    swiglu_x = run_swiglu(d_model,d_ff,weights["ffn.w1.weight"],weights["ffn.w2.weight"],weights["ffn.w3.weight"],normed_x2)
-    out_t = residual + swiglu_x
-    return out_t
+    block = TransformerBlock(d_model, num_heads, d_ff, max_seq_len, theta, eps=1e-5)
+    block.load_ref_state_dict(weights)
+    return block(in_features, None)
 
 
 def run_transformer_lm(
@@ -388,32 +358,17 @@ Float[Tensor, "batch_size sequence_length vocab_size"]: 包含每个词元预测
 下一个词分布的张量。
 
 """
-    # Token Embedding
-    token_embeddings = run_embedding(
-        vocab_size, d_model, weights["token_embeddings.weight"], in_indices
+    lm = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
     )
-    x = token_embeddings
-    # 逐层跑 Transformer block，每层从 weights 里取 layers.{i}.xxx 并转成 block 需要的键名
-    for i in range(num_layers):
-        layer_prefix = f"layers.{i}."
-        block_weights = {
-            k[len(layer_prefix) :]: v
-            for k, v in weights.items()
-            if k.startswith(layer_prefix)
-        }
-        x = run_transformer_block(
-            d_model=d_model,
-            num_heads=num_heads,
-            d_ff=d_ff,
-            max_seq_len=context_length,
-            theta=rope_theta,
-            weights=block_weights,
-            in_features=x,
-        )
-    # 最后一层 RMSNorm + lm_head
-    norm_out = run_rmsnorm(d_model, 1e-5, weights["ln_final.weight"], x)
-    logits = run_linear(d_model, vocab_size, weights["lm_head.weight"], norm_out)
-    return logits
+    lm.load_ref_state_dict(weights)
+    return lm(in_indices)
 
 
 
@@ -515,37 +470,7 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    batch_size = inputs.shape[0]
-    # 沿着dim = 1找到最大
-    #使用 .values 获取数值，使用 keepdim=True 保持形状为 (batch_size, 1) 以便广播
-    line_max = inputs.max(dim=1,keepdim=True).values
-    # Exp & Sum: (inputs - max).exp().sum(dim=1).log()
-    # (B, V) - (B, 1) -> (B, V) -> sum -> (B,) -> log -> (B,)
-    exp_sum = (inputs - line_max).exp().sum(dim=1).log()
-    # Restore: 加上刚才减去的 max，得到完整的 Log-Sum-Exp。
-    # 修正点：line_max 是 (B, 1)，exp_sum_log 是 (B,)。
-    log_sum_exp = exp_sum + line_max.squeeze(1)
-    # 4. 获取目标类别的 Logits (分子部分)
-    # 使用高级索引 (Advanced Indexing)
-    # inputs[i, targets[i]] 取出每个样本对应真实标签的 logit
-    # torch.arange(batch_size) 生成 [0, 1, ..., batch-1]
-    """
-    inputs[row_index:Tensor, col_index:Tensor]
-    那么 PyTorch 的规则是：逐元素配对索引
-    inputs[row_index[i], col_index[i]]   for each i
-    row_index = torch.arange(batch_size)  # [0, 1, 2]
-    col_index = targets                   # [2, 3, 4]  ====>target_logits = tensor([
-    inputs[0, 2],   # sample 0 的真实类别 logit
-    inputs[1, 3],   # sample 1 的真实类别 logit
-    inputs[2, 4],   # sample 2 的真实类别 logit
-])
-
-    """
-    target_logits = inputs[torch.arange(batch_size), targets]
-    # 5. 计算损失并求平均
-    # Loss = LSE - Target_Logit
-    losses = log_sum_exp - target_logits
-    return torch.mean(losses)
+    return CrossEntropyLoss()(inputs, targets)
 
 
 
@@ -653,62 +578,7 @@ def run_train_bpe(
     special_tokens: list[str],#要添加到词汇表的字符串列表
     **kwargs,
 ) -> tuple[ dict[int, bytes], list[tuple[bytes, bytes]] ]:
-    #dict[int, bytes] 分词器词汇表，从 int（词汇表中的分词 ID）到 bytes（分词字节）的映射。
-    #训练生成的 BPE 合并列表。每个列表项都是一个字节元组 (<token1>, <token2>)，表示 <token1> 已与 <token2> 合并。合并应按创建顺序排序。
-    # 1. 读取文本并转换为字节 ID 列表
-    with open(input_path, "r",encoding='utf-8') as f:
-        text = f.read()
-
-        """
-        改进：预处理特殊字符，若有特殊字符，按照特殊字符切分为多段
-        """
-    if special_tokens:
-        # 对特殊字符进行转义（如 | -> \|），并用 | 连接成正则
-        # 结果类似: "\<\|endoftext\|\>|\<\|pad\|\>"
-        pattern = "|".join(re.escape(tok) for tok in special_tokens)
-        text_segments = re.split(pattern, text)
-    else:
-        text_segments = [text]
-        #使用GPT - 2风格的正则进行预分词
-        # 这会将文本拆分为单词列表，例如 ["The", " world", " is", ...]
-    PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
-    #统计单词出现的频次
-    vocab_counts = Counter()
-    for text in text_segments:
-        #根据特殊字符切分后的各个语句统计单词
-        if not text:continue
-        #对片段进行切分
-        words = re.findall(PAT, text)
-        #统计单词内的频率
-        for word in words:
-            word_bytes = tuple(word.encode("utf-8"))
-            vocab_counts[word_bytes] += 1
-        #初始化基础词表
-    vocab = {idx: bytes([idx]) for idx in range(256)}
-     #预留合并的词表个数
-    merges_num = vocab_size - 256 - len(special_tokens)
-    merges_indices = []
-    #主循环
-    for i in range (merges_num):
-        stats = get_stats(vocab_counts)
-        if not stats:
-            break
-        # 找到频率最高的 pair；同频时按 GPT-2 约定用字节字典序断序 (vocab[p[0]], vocab[p[1]])
-        max_pair = max(stats, key=lambda p: (stats[p], vocab[p[0]], vocab[p[1]]))
-        merges_indices.append(max_pair)
-        new_id = 256 + i
-        vocab[new_id] = vocab[max_pair[0]] + vocab[max_pair[1]]
-        vocab_counts = merge_ids(vocab_counts,max_pair,new_id)
-    #后处理，将特殊字符放入词表
-    current_idx = 256 + len(merges_indices)
-    for token in special_tokens:
-        vocab[current_idx] = token.encode("utf-8")
-        current_idx += 1
-    #格式化输出
-    final_merges = []
-    for p0,p1 in merges_indices:
-        final_merges.append((vocab[p0], vocab[p1]))
-    return vocab, final_merges
+    return BPETrainer().train(input_path, vocab_size, special_tokens, **kwargs)
 
 
 

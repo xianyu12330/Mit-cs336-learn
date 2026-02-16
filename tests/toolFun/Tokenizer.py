@@ -1,9 +1,10 @@
 import collections
+from collections import Counter
 from typing import List, Tuple, Dict
 
 import json
 import regex as re
-from collections.abc import Iterator,Iterable
+from collections.abc import Iterator, Iterable
 
 
 def get_stats(vocab_counts: Dict[Tuple[int, ...], int]) -> Dict[Tuple[int, int], int]:
@@ -113,9 +114,19 @@ class BPETokenizer:
         vocab = {}
         for key, value in file_json.items():
             # GPT-2 等格式多为 {"token_str": id}，即 value 为 id
-            idx = int(value)
-            token_bytes = key.encode("utf-8") if isinstance(key, str) else key
-            vocab[idx] = token_bytes
+            # 尝试判断是哪种格式
+            # 如果值(v)是整数，或者值可以被转换为整数，说明是 { "Token": ID } 格式
+            if isinstance(value, int) or (isinstance(value, str) and value.isdigit()):
+                token = key
+                idx = int(value)
+                # 如果键(k)可以被转换为整数，说明是 { "ID": "Token" } 格式（你当前遇到的情况）
+            elif isinstance(key, str) and key.isdigit():
+                idx = int(key)
+                token = value
+            else:
+                raise ValueError(f"无法解析的 vocab 格式: 键={k}, 值={v}")
+
+            vocab[token] = idx  # 确保你在内存中存的是 Token -> ID 的映射
         #第二步：解析 Merges 文件 (Text -> List)
         #打开文件，按行读取
         merge = []
@@ -207,6 +218,56 @@ class BPETokenizer:
             if ids_id in self.vocab:
                 token_bytes.extend(self.vocab[ids_id])
         return token_bytes.decode("utf-8", errors="replace")
+
+
+class BPETrainer:
+    """封装 BPE 训练流程，对应 adapters.run_train_bpe。"""
+
+    def train(
+        self,
+        input_path: str,
+        vocab_size: int,
+        special_tokens: list[str] | None = None,
+        **kwargs,
+    ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+        special_tokens = special_tokens or []
+        with open(input_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        if special_tokens:
+            pattern = "|".join(re.escape(tok) for tok in special_tokens)
+            text_segments = re.split(pattern, text)
+        else:
+            text_segments = [text]
+        PAT = re.compile(
+            r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+        )
+        vocab_counts = Counter()
+        for seg in text_segments:
+            if not seg:
+                continue
+            for word in re.findall(PAT, seg):
+                word_bytes = tuple(word.encode("utf-8"))
+                vocab_counts[word_bytes] += 1
+        vocab = {idx: bytes([idx]) for idx in range(256)}
+        merges_num = vocab_size - 256 - len(special_tokens)
+        merges_indices = []
+        for i in range(merges_num):
+            stats = get_stats(vocab_counts)
+            if not stats:
+                break
+            max_pair = max(
+                stats, key=lambda p: (stats[p], vocab[p[0]], vocab[p[1]])
+            )
+            merges_indices.append(max_pair)
+            new_id = 256 + i
+            vocab[new_id] = vocab[max_pair[0]] + vocab[max_pair[1]]
+            vocab_counts = merge_ids(vocab_counts, max_pair, new_id)
+        current_idx = 256 + len(merges_indices)
+        for token in special_tokens:
+            vocab[current_idx] = token.encode("utf-8")
+            current_idx += 1
+        final_merges = [(vocab[p0], vocab[p1]) for p0, p1 in merges_indices]
+        return vocab, final_merges
 
 
 

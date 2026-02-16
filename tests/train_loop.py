@@ -6,15 +6,19 @@
 """
 from __future__ import annotations
 
-import argparse
-import json
-import os
+
 import sys
+from fileinput import filename
 from pathlib import Path
 
-import numpy as np
-import torch
-import torch.nn as nn
+
+import wandb
+
+
+from tests.toolFun.Optimizer import Adamw,Cosine,GradientClip
+from tests.toolFun.Tokenizer import BPETokenizer
+from tests.toolFun.dataLord import get_batch,save_checkpoint,load_checkpoint
+from tests.toolFun.transformer import CrossEntropyLoss
 
 # 保证 tests 可导入
 if __name__ == "__main__" and __file__:
@@ -22,315 +26,82 @@ if __name__ == "__main__" and __file__:
     if str(_root) not in sys.path:
         sys.path.insert(0, str(_root))
 
-from tests.adapters import (
-    get_adamw_cls,
-    get_tokenizer,
-    run_cross_entropy,
-    run_get_batch,
-    run_get_lr_cosine_schedule,
-    run_gradient_clipping,
-    run_load_checkpoint,
-    run_save_checkpoint,
-    run_transformer_block,
-    run_transformer_lm,
-    run_embedding,
-    run_rmsnorm,
-    run_linear,
-)
-from tests.common import gpt2_bytes_to_unicode
-from tests.toolFun.transformer import Embedding, Linear, RMSNorm, SwiGLU
 
 
-# ---------- 模型定义：与 run_transformer_* 的 state_dict 键一致，便于 checkpoint 与消融 ----------
-class TransformerBlock(nn.Module):
-    """单层 Transformer block，state_dict 键与 adapters.run_transformer_block 一致。"""
+from tests.toolFun.transformer import Embedding, Linear, RMSNorm, SwiGLU, TransformerLM
 
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, rope_theta: float):
-        super().__init__()
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_ff = d_ff
-        self.max_seq_len = max_seq_len
-        self.rope_theta = rope_theta
-        self.ln1 = RMSNorm(d_model, eps=1e-5)
-        self.attn = nn.ModuleDict({
-            "q_proj": Linear(d_model, d_model),
-            "k_proj": Linear(d_model, d_model),
-            "v_proj": Linear(d_model, d_model),
-            "output_proj": Linear(d_model, d_model),
-        })
-        self.ln2 = RMSNorm(d_model, eps=1e-5)
-        self.ffn = nn.ModuleDict({
-            "w1": Linear(d_model, d_ff),
-            "w2": Linear(d_ff, d_model),
-            "w3": Linear(d_model, d_ff),
-        })
-    #把当前模块的参数字典改名，使它和 adapters 里的实现“键名完全匹配”。
-    def _block_weights(self):
-        sd = self.state_dict()
-        # adapters 里 RMSNorm 的键为 ln1.weight / ln2.weight，我们这里是 ln1.weights / ln2.weights
-        out = {}
-        #ky只是变量名，不是attention里的key，只有 RMSNorm 的命名和 adapters 版本不一样。
-        for k, v in sd.items():
-            if k == "ln1.weights":
-                out["ln1.weight"] = v
-            elif k == "ln2.weights":
-                out["ln2.weight"] = v
-            else:
-                out[k] = v
-        return out
+import argparse
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return run_transformer_block(
-            d_model=self.d_model,
-            num_heads=self.num_heads,
-            d_ff=self.d_ff,
-            max_seq_len=self.max_seq_len,
-            theta=self.rope_theta,
-            weights=self._block_weights(),
-            in_features=x,
-        )
+import os
 
 
-class TransformerLM(nn.Module):
-    """Transformer 语言模型，forward 与 run_transformer_lm 一致，便于消融时替换组件。"""
-
-    def __init__(
-        self,
-        vocab_size: int,
-        context_length: int,
-        d_model: int,
-        num_layers: int,
-        num_heads: int,
-        d_ff: int,
-        rope_theta: float = 10000.0,
-    ):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.context_length = context_length
-        self.d_model = d_model
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.d_ff = d_ff
-        self.rope_theta = rope_theta
-
-        self.token_embeddings = Embedding(vocab_size, d_model)
-        self.layers = nn.ModuleList([
-            TransformerBlock(d_model, num_heads, d_ff, context_length, rope_theta)
-            for _ in range(num_layers)
-        ])
-        self.ln_final = RMSNorm(d_model, eps=1e-5)
-        self.lm_head = Linear(d_model, vocab_size)
-
-    def _lm_weights(self):
-        sd = self.state_dict()
-        out = {}
-        for k, v in sd.items():
-            if k == "ln_final.weights":
-                out["ln_final.weight"] = v
-            elif k == "token_embeddings.embed_table":
-                out["token_embeddings.weight"] = v
-            else:
-                out[k] = v
-        return out
-
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
-        return run_transformer_lm(
-            vocab_size=self.vocab_size,
-            context_length=self.context_length,
-            d_model=self.d_model,
-            num_layers=self.num_layers,
-            num_heads=self.num_heads,
-            d_ff=self.d_ff,
-            rope_theta=self.rope_theta,
-            weights=self._lm_weights(),
-            in_indices=idx,
-        )
+import numpy as np
+import torch
 
 
-# ---------- Tokenizer：从 vocab/merges 文件加载（GPT-2 风格） ----------
-def load_tokenizer_from_files(
-    vocab_path: str | Path,
-    merges_path: str | Path,
-    special_tokens: list[str] | None = None,
-):
-    """从 vocab.json + merges.txt 加载 BPE tokenizer（格式与 GPT-2 一致：vocab 为 token_str -> id）。"""
-    gpt2_byte_decoder = {v: k for k, v in gpt2_bytes_to_unicode().items()}
-    with open(vocab_path, encoding="utf-8") as f:
-        gpt2_vocab = json.load(f)
-    merges_raw = []
-    with open(merges_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.rstrip()
-            if line and len(line.split()) == 2:
-                merges_raw.append(tuple(line.split()))
-    vocab = {
-        int(idx): bytes([gpt2_byte_decoder[c] for c in token_str])
-        for token_str, idx in gpt2_vocab.items()
-    }
-    if special_tokens:
-        for tok in special_tokens:
-            b = tok.encode("utf-8")
-            if b not in set(vocab.values()):
-                vocab[max(vocab.keys()) + 1] = b
-    merges = [
-        (bytes([gpt2_byte_decoder[c] for c in t1]), bytes([gpt2_byte_decoder[c] for c in t2]))
-        for t1, t2 in merges_raw
-    ]
-    return get_tokenizer(vocab, merges, special_tokens)
 
-
-# ---------- 数据加载：memmap / npy，或从 .txt 流式 tokenize 后保存 ----------
-def load_dataset_memmap(path: str | Path, dtype=np.int64, mmap_mode: str = "r") -> np.ndarray:
-    """内存高效加载：.npy 用 np.load(..., mmap_mode)，其它按 int64 二进制 memmap。"""
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Dataset not found: {path}")
-    if path.suffix == ".npy":
-        return np.load(path, mmap_mode=mmap_mode, allow_pickle=False)
-    size = path.stat().st_size
-    assert size % np.dtype(dtype).itemsize == 0
-    return np.memmap(path, dtype=dtype, mode=mmap_mode, shape=(size // np.dtype(dtype).itemsize,))
-
-
-def get_data_paths(data_dir: str | Path, train_name: str = "train", val_name: str = "val"):
-    """优先返回已 tokenize 的 .npy/.dat/.bin；若不存在则返回 (None, None)。"""
-    data_dir = Path(data_dir)
-    for ext in (".npy", ".dat", ".bin"):
-        train_path = data_dir / f"{train_name}{ext}"
-        val_path = data_dir / f"{val_name}{ext}"
-        if train_path.exists():
-            return train_path, val_path if val_path.exists() else None
-    return None, None
-
-
-def get_txt_paths(data_dir: str | Path):
-    """若 data 下只有 .txt，返回 (train_txt, val_txt)。支持 train.txt/val.txt 或 TinyStories 式命名。"""
-    data_dir = Path(data_dir)
-    candidates_train = [
-        data_dir / "train.txt",
-        data_dir / "TinyStoriesV2-GPT4-train.txt",
-    ]
-    candidates_val = [
-        data_dir / "val.txt",
-        data_dir / "valid.txt",
-        data_dir / "TinyStoriesV2-GPT4-valid.txt",
-    ]
-    train_txt = None
-    for p in candidates_train:
-        if p.exists():
-            train_txt = p
-            break
-    if not train_txt:
-        # 任意 .txt 取第一个作 train
-        txts = sorted(data_dir.glob("*.txt"))
-        if txts:
-            train_txt = txts[0]
-    val_txt = None
-    for p in candidates_val:
-        if p.exists() and p != train_txt:
-            val_txt = p
-            break
-    if train_txt is None:
-        return None, None
-    return train_txt, val_txt
-
-
-def tokenize_txt_to_npy(
-    txt_path: Path,
-    tokenizer,
-    out_path: Path,
-    chunk_lines: int = 5000,
-) -> int:
+# 数据准备，将。txt文件转化可处理的类型
+def prepare_data(txt_path: str, bin_path: str, tokenizer: BPETokenizer, chunk_size: int = 1024 * 1024):
     """
-    流式读取 .txt，按行 tokenize，顺序写入 int64 二进制再转为 .npy，避免整文件进内存。
-    返回写入的 token 总数。
+    将文本文档流式编码并写入 np.memmap 文件。
     """
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    bin_path = out_path.with_suffix(out_path.suffix + ".bin.tmp")
-    count = 0
-    with open(bin_path, "wb") as f:
-        with open(txt_path, "r", encoding="utf-8", errors="replace") as inp:
-            buf = []
-            for line in inp:
-                line = line.strip()
-                if not line:
-                    continue
-                ids = tokenizer.encode(line)
-                buf.extend(ids)
-                if len(buf) >= chunk_lines * 50:  # 每批写入
-                    arr = np.array(buf, dtype=np.int64)
-                    f.write(arr.tobytes())
-                    count += len(arr)
-                    buf = []
-            if buf:
-                arr = np.array(buf, dtype=np.int64)
-                f.write(arr.tobytes())
-                count += len(arr)
-    with open(bin_path, "rb") as f:
-        data = np.frombuffer(f.read(), dtype=np.int64)
-    np.save(out_path, data, allow_pickle=False)
-    bin_path.unlink(missing_ok=True)
-    return len(data)
+    print(f"🚀 开始处理: {txt_path}")
+
+    # 1. 定义一个文本块生成器
+    def text_generator(filepath, size):
+        with open(filepath, 'r', encoding='utf-8') as f:
+            while True:
+                chunk = f.read(size)
+                if not chunk: break
+                yield chunk
+
+    # 2. 调用你的流式编码接口，得到一个吐出 ID 的迭代器
+    token_iterator = tokenizer.encode_iterable(text_generator(txt_path, chunk_size))
+    # 3. 准备写入 memmap
+    # 注意：BPE 词表通常小于 65536，所以用 uint16。如果你的词表超过了这个数，请改为 np.int32
+    dtype = np.uint16
+    # 因为不知道总长度，我们先创建一个临时列表缓存一小批数据，然后再写入
+    # 这样可以平衡 I/O 速度和内存占用
+    write_batch_size = 1024 * 1024 * 10  # 每次往硬盘写 1000 万个 token
+    buffer = []
+    total_tokens = 0
+    # 为了动态扩展 memmap，我们需要先用 'w+' 模式创建一个初始空文件
+    # 但 numpy memmap 不支持动态 append，所以我们的策略是：先收集，再分段写入文件
+    # 这里为了代码简洁且兼容绝大多数普通级别的数据集（几千万 tokens），我们采用分批追加写普通二进制文件的方法
+    print(f"正在编码并写入 {bin_path}...")
+    with open(bin_path, 'wb') as f:
+        for token_id in token_iterator:
+            buffer.append(token_id)
+            if len(buffer) >= write_batch_size:
+                # 将 buffer 转为 numpy 数组并转换为字节写入
+                np_buffer = np.array(buffer, dtype=dtype)
+                f.write(np_buffer.tobytes())
+                total_tokens += len(buffer)
+                buffer.clear()
+                print(f"已处理 {total_tokens / 1e6:.2f} M tokens...")
+        # 处理最后一批剩余的数据
+        if buffer:
+            np_buffer = np.array(buffer, dtype=dtype)
+            f.write(np_buffer.tobytes())
+            total_tokens += len(buffer)
+            buffer.clear()
+
+    print(f"✅ 处理完成！共计 {total_tokens} 个 tokens。")
+    print(f"文件已保存至: {bin_path}\n")
 
 
-# ---------- 训练一步与验证 ----------
-def train_step(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    x: torch.Tensor,
-    y: torch.Tensor,
-    grad_clip: float | None,
-    device: str,
-) -> float:
-    model.train()
-    x, y = x.to(device), y.to(device)
-    optimizer.zero_grad()
-    logits = model(x)
-    # logits: (B, T, V) -> (B*T, V); y: (B, T) -> (B*T)
-    B, T, V = logits.shape
-    loss = run_cross_entropy(logits.reshape(-1, V), y.reshape(-1))
-    loss.backward()
-    if grad_clip is not None and grad_clip > 0:
-        run_gradient_clipping(model.parameters(), grad_clip)
-    optimizer.step()
-    return loss.item()
-
-
-@torch.no_grad()
-def eval_loss(model: nn.Module, dataset: np.ndarray, batch_size: int, context_length: int, device: str, num_batches: int = 50) -> float:
-    model.eval()
-    total_loss = 0.0
-    n = 0
-    for _ in range(num_batches):
-        x, y = run_get_batch(dataset, batch_size, context_length, device)
-        logits = model(x)
-        B, T, V = logits.shape
-        loss = run_cross_entropy(logits.reshape(-1, V), y.reshape(-1))
-        total_loss += loss.item()
-        n += 1
-    return total_loss / max(n, 1)
-
-
-# ---------- 日志（控制台 + 可选 wandb） ----------
-def log_scalar(step: int, key: str, value: float, use_wandb: bool, wandb_run=None):
-    print(f"  step {step}  {key}={value:.6f}")
-    if use_wandb and wandb_run is not None:
-        wandb_run.log({key: value}, step=step)
-
-
-# ---------- 主入口 ----------
-def parse_args():
+def main():
     p = argparse.ArgumentParser(description="Train Transformer LM (data in data/)")
     # 实验与路径
-    p.add_argument("--exp_name", type=str, default="baseline", help="Experiment name for logging/checkpoints")
-    p.add_argument("--data_dir", type=str, default="data", help="Directory for train/val data (.npy/.txt)")
-    p.add_argument("--vocab_path", type=str, default=None, help="vocab.json path (required when data is .txt)")
-    p.add_argument("--merges_path", type=str, default=None, help="merges.txt path (required when data is .txt)")
-    p.add_argument("--special_tokens", type=str, default="<|endoftext|>", help="Comma-separated special tokens, e.g. <|endoftext|>")
-    p.add_argument("--ckpt_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
-    p.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    p.add_argument("--run_name", type=str, default=None, help="WandB 实验名称")
+    p.add_argument("--data_dir", type=str, default="data")
+    p.add_argument("--vocab_path", type=str, default=None, )
+    p.add_argument("--merges_path", type=str, default=None, )
+    p.add_argument("--special_tokens", nargs='*', default = ["<|endoftext|>"])
+    p.add_argument("--ckpt_dir", type=str, default="checkpoints")
+    p.add_argument("--out_dir", type=str, default="out_dir")
+
+
     # 模型
     p.add_argument("--vocab_size", type=int, default=10000)
     p.add_argument("--context_length", type=int, default=256)
@@ -341,8 +112,7 @@ def parse_args():
     p.add_argument("--rope_theta", type=float, default=10000.0)
     # 训练
     p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--epochs", type=int, default=10)
-    p.add_argument("--max_iters", type=int, default=None, help="Max steps (overrides epochs if set)")
+    p.add_argument("--max_iters", type=int, default=10000, help="Max steps (overrides epochs if set)")
     p.add_argument("--lr_max", type=float, default=3e-4)
     p.add_argument("--lr_min", type=float, default=3e-5)
     p.add_argument("--warmup_iters", type=int, default=500)
@@ -354,45 +124,36 @@ def parse_args():
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--use_wandb", action="store_true", help="Log to Weights & Biases")
-    return p.parse_args()
+    args = p.parse_args()
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    os.makedirs(args.out_dir, exist_ok=True)
+    # 1.加载数据
+    data_dir = "data"
+    tokenizer = BPETokenizer.from_files(args.vocab_path, args.merges_path, args.special_tokens)
+    train_txt = os.path.join(data_dir, "TinyStoriesV2-GPT4-train.txt")
+    test_txt = os.path.join(data_dir, "TinyStoriesV2-GPT4-valid.txt")
 
+    train_bin = os.path.join(data_dir, "train.bin")
+    test_bin = os.path.join(data_dir, "test.bin")
 
-def main():
-    args = parse_args()
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    # 2. 执行转换 (如果文件存在才执行)
+    if os.path.exists(train_txt) and not os.path.exists(train_bin):
+        print("未找到训练集 bin 文件，开始预处理...")
+        prepare_data(train_txt, train_bin, tokenizer)
+    else:
+        print(f"找不到文件: {train_txt}")
 
-    # 数据：优先已 tokenize 的 .npy/.dat；否则用 .txt + vocab/merges 现场 tokenize 再训练
-    data_dir = Path(args.data_dir)
-    train_path, val_path = get_data_paths(args.data_dir)
-    if train_path is None:
-        train_txt, val_txt = get_txt_paths(args.data_dir)
-        if train_txt is None:
-            print("No train data found. Put either train.npy (or train.dat) or train.txt in data/.")
-            return 1
-        if not args.vocab_path or not args.merges_path:
-            print("Data folder has .txt but no pre-tokenized .npy. Provide --vocab_path and --merges_path to tokenize from .txt.")
-            print("Example: --vocab_path tests/fixtures/gpt2_vocab.json --merges_path tests/fixtures/gpt2_merges.txt")
-            return 1
-        special_list = [s.strip() for s in args.special_tokens.split(",") if s.strip()]
-        print("Loading tokenizer from", args.vocab_path, args.merges_path)
-        tokenizer = load_tokenizer_from_files(args.vocab_path, args.merges_path, special_list or None)
-        train_npy = data_dir / "train.npy"
-        print("Tokenizing train .txt ->", train_npy)
-        tokenize_txt_to_npy(train_txt, tokenizer, train_npy)
-        train_path = train_npy
-        if val_txt and val_txt.exists():
-            val_npy = data_dir / "val.npy"
-            print("Tokenizing val .txt ->", val_npy)
-            tokenize_txt_to_npy(val_txt, tokenizer, val_npy)
-            val_path = val_npy
-        else:
-            val_path = None
-    train_data = load_dataset_memmap(train_path)
-    val_data = load_dataset_memmap(val_path) if val_path is not None else train_data
-    print(f"Train tokens: {len(train_data)}, Val tokens: {len(val_data)}")
+    if os.path.exists(test_txt) and not os.path.exists(test_bin):
+        prepare_data(test_txt, test_bin, tokenizer)
+    else:
+        print(f"找不到文件: {test_txt}")
 
-    # 模型与优化器
+    # --- 1. 使用 memmap 加载数据 ---
+    # 注意 dtype 必须和写入时（上面代码中的 np.uint16）完全一致
+    # mode='r' 表示只读，防止训练时意外修改了原始数据
+    train_data = np.memmap(train_bin, dtype=np.uint16, mode='r')
+    test_data = np.memmap(test_bin, dtype=np.uint16, mode='r')
+
     model = TransformerLM(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
@@ -401,68 +162,69 @@ def main():
         num_heads=args.num_heads,
         d_ff=args.d_ff,
         rope_theta=args.rope_theta,
+        device=args.device,
     ).to(args.device)
-    optimizer = get_adamw_cls()(
-        model.parameters(),
-        lr=args.lr_max,
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.999),
-        eps=1e-8,
+
+    #4.初始化优化器
+    optimizer = Adamw(model.parameters(), lr=args.lr_max,weight_decay=0.1)
+    #5.检查点恢复逻辑
+    start_iter = 0
+    ckpt_path = os.path.join(args.ckpt_dir, "ckpt.pt")
+    if os.path.exists(ckpt_path):
+        start_iter = load_checkpoint(ckpt_path, model, optimizer)
+        print(f"Resuming from iteration {start_iter}")
+
+    #6.初始化wandb监控
+    wandb.init(
+        project="cs336-assignment1-basics",
+        name=args.run_name,
+        config=args,
     )
 
-    # 学习率调度：cosine + warmup（总步数由 epochs 或 max_iters 决定）
-    tokens_per_epoch = max(1, len(train_data) - args.context_length - 1)
-    steps_per_epoch = max(1, tokens_per_epoch // (args.batch_size * (args.context_length + 1)))
-    total_iters = args.max_iters if args.max_iters is not None else args.epochs * steps_per_epoch
-    cosine_cycle_iters = max(1, total_iters - args.warmup_iters)
-    def get_lr(it):
-        return run_get_lr_cosine_schedule(
-            it, args.lr_max, args.lr_min, args.warmup_iters, cosine_cycle_iters
-        )
+    #7.主训练循环
+    for it in range(start_iter, args.max_iters):
+        #更新学习率
+        lr = Cosine(
+            max_learning_rate=args.lr_max,
+            min_learning_rate=args.lr_min,
+            warmup_iters=args.warmup_iters,
+            cosine_cycle_iters = args.max_iters)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+        #训练
+        model.train()
+        x,y = get_batch(numpy_x=train_data,batch_size=args.batch_size,context_length=args.context_length,device=args.device)
+        logits = model(x)
+        loss = CrossEntropyLoss(logits=logits,y=y,device=args.device)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        #梯度裁剪
+        GradientClip(model.parameters(),args.grad_clip)
+        optimizer.step()
 
-    start_iter = 0
-    if args.resume:
-        start_iter = run_load_checkpoint(args.resume, model, optimizer)
-        print(f"Resumed from iteration {start_iter}")
+        #验证与日记记录
+        if it % args.eval_every == 0 or it == args.max_iters - 1:
+            model.eval()
+            with torch.no_grad():
+                vx,vy = get_batch(numpy_x=test_data,batch_size=args.batch_size,context_length=args.context_length,device=args.device)
+                v_logits = model(vx)
+                v_loss = CrossEntropyLoss(logits=v_logits,y=vy,device=args.device)
+                print(f"Iter: {it}, train loss: {loss.item():.4f}, val_loss: {v_loss.item():.4f}, lr: {lr:.6f}")
+                wandb.log({
+                    "train/loss":loss.item(),
+                    "val/loss":v_loss.item(),
+                    "lr":lr,
+                    "iter":it + 1,
+                })
+                #保存检查点，每500步保存一次
+                if it % args.eval_every == 0 and it > 0:
+                    save_checkpoint(model, optimizer, it, ckpt_path)
 
-    wandb_run = None
-    if args.use_wandb:
-        try:
-            import wandb
-            wandb_run = wandb.init(project="transformer-lm", name=args.exp_name, config=vars(args))
-        except Exception as e:
-            print("wandb not available:", e)
-
-    ckpt_dir = Path(args.ckpt_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    config_path = ckpt_dir / f"{args.exp_name}_config.json"
-    with open(config_path, "w") as f:
-        json.dump(vars(args), f, indent=2)
-    print(f"Config saved to {config_path}")
-
-    # 训练循环
-    for it in range(start_iter, total_iters):
-        lr = get_lr(it)
-        for g in optimizer.param_groups:
-            g["lr"] = lr
-        x, y = run_get_batch(train_data, args.batch_size, args.context_length, args.device)
-        loss = train_step(model, optimizer, x, y, args.grad_clip, args.device)
-
-        if (it + 1) % args.log_every == 0:
-            log_scalar(it + 1, "train_loss", loss, args.use_wandb, wandb_run)
-            log_scalar(it + 1, "lr", lr, args.use_wandb, wandb_run)
-        if (it + 1) % args.eval_every == 0:
-            val_loss = eval_loss(model, val_data, args.batch_size, args.context_length, args.device)
-            log_scalar(it + 1, "val_loss", val_loss, args.use_wandb, wandb_run)
-        if (it + 1) % args.ckpt_every == 0:
-            ckpt_path = ckpt_dir / f"{args.exp_name}_iter_{it+1}.pt"
-            run_save_checkpoint(model, optimizer, it + 1, ckpt_path)
-            print(f"Checkpoint saved: {ckpt_path}")
-
-    run_save_checkpoint(model, optimizer, total_iters, ckpt_dir / f"{args.exp_name}_final.pt")
-    print("Done.")
-    return 0
+    #训练结束保存最终模型
+    save_checkpoint(model, optimizer, args.max_iters, os.path.join(args.out_dir, "ckpt_final.pt"))
+    wandb.finish()
+if __name__ == '__main__':
+    main()
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+

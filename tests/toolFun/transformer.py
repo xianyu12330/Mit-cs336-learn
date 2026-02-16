@@ -142,10 +142,14 @@ class Rope(nn.Module):
 
         cos = self.cos_cache[token_positions][..., : self.d_k // 2]  # [..., d_k/2]
         sin = self.sin_cache[token_positions][..., : self.d_k // 2]
-        # token_positions 为 1D 时需加 batch 维以便与 x [B, Seq, d_k] 广播
+        # token_positions 为 1D 时需加 batch 维；x 为 (B, Seq, d_k) 或 (B, num_heads, Seq, d_k) 时需能与 cos 广播
         if cos.dim() == 2:
             cos = cos.unsqueeze(0)
             sin = sin.unsqueeze(0)
+        if cos.dim() == 3:
+            # (1, T, d_k/2) -> (1, 1, T, d_k/2) 以便与 (B, num_heads, T, head_dim/2) 广播
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
         # 奇数、偶数位置
         x1 = x[..., 0::2]  # 偶数 [..., d_k/2]
         x2 = x[..., 1::2]  # 奇数 [..., d_k/2]
@@ -219,9 +223,136 @@ class MultiHeadAttention(nn.Module):
         return out @ self.out_proj
 
 
+class MultiHeadAttentionWithRoPE(nn.Module):
+    """带 RoPE 的多头自注意力，对应 adapters.run_multihead_self_attention_with_rope 的逻辑。"""
+
+    def __init__(self, d_model: int, num_heads: int, max_seq_len: int, theta: float):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.max_seq_len = max_seq_len
+        self.theta = theta
+        self.q_proj = Linear(d_model, d_model)
+        self.k_proj = Linear(d_model, d_model)
+        self.v_proj = Linear(d_model, d_model)
+        self.output_proj = Linear(d_model, d_model)
+        self.rope = Rope(theta=theta, d_k=self.head_dim, max_seq_len=max_seq_len)
+        self.attn = DotAttention()
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
+        B, T, D = x.shape
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        if token_positions is None:
+            token_positions = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
+        q = self.rope(q, token_positions)
+        k = self.rope(k, token_positions)
+        causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=q.dtype)).view(1, 1, T, T)
+        out = self.attn(q, k, v, mask=causal_mask)
+        out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
+        return self.output_proj(out)
+
+    def load_ref_state_dict(self, state: dict):
+        """参考 state_dict 与 PyTorch 一致：(out, in)，计算为 x @ W.T，直接加载。"""
+        self.q_proj.W.data = state["attn.q_proj.weight"].clone()
+        self.k_proj.W.data = state["attn.k_proj.weight"].clone()
+        self.v_proj.W.data = state["attn.v_proj.weight"].clone()
+        self.output_proj.W.data = state["attn.output_proj.weight"].clone()
 
 
+class TransformerBlock(nn.Module):
+    """预归一化 Transformer 块：ln1 -> MHA+RoPE -> 残差 -> ln2 -> SwiGLU -> 残差。"""
 
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float, eps: float = 1e-5):
+        super().__init__()
+        self.ln1 = RMSNorm(d_model, eps=eps)
+        self.attn = MultiHeadAttentionWithRoPE(d_model, num_heads, max_seq_len, theta)
+        self.ln2 = RMSNorm(d_model, eps=eps)
+        self.ffn = SwiGLU(d_model, d_ff)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
+        residual = x
+        x = self.ln1(x)
+        x = self.attn(x, token_positions)
+        x = residual + x
+        residual = x
+        x = self.ln2(x)
+        x = self.ffn(x)
+        return residual + x
+
+    def load_ref_state_dict(self, state: dict):
+        self.ln1.weights.data = state["ln1.weight"]
+        self.attn.load_ref_state_dict(state)
+        self.ln2.weights.data = state["ln2.weight"]
+        # ref: w1 (d_model, d_ff), w2 (d_ff, d_model), w3 (d_model, d_ff); 我们 W1 (d_ff, d_model) 等
+        self.ffn.W1.data = state["ffn.w1.weight"].clone()
+        self.ffn.W2.data = state["ffn.w2.weight"].clone()
+        self.ffn.W3.data = state["ffn.w3.weight"].clone()
+
+
+class TransformerLM(nn.Module):
+    """Transformer 语言模型：embedding -> N × TransformerBlock -> ln_final -> lm_head。"""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float = 10000.0,
+        device = None
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, num_heads, d_ff, context_length, rope_theta)
+            for _ in range(num_layers)
+        ])
+        self.token_embeddings = Embedding(vocab_size, d_model)
+        self.ln_final = RMSNorm(d_model)
+        self.lm_head = Linear(d_model, vocab_size)
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        x = self.token_embeddings(idx)
+        B, T, _ = x.shape
+        token_positions = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
+        for layer in self.layers:
+            x = layer(x, token_positions)
+        x = self.ln_final(x)
+        return self.lm_head(x)
+
+    def load_ref_state_dict(self, state: dict):
+        self.token_embeddings.embed_table.data = state["token_embeddings.weight"]
+        for i in range(self.num_layers):
+            prefix = f"layers.{i}."
+            block_state = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+            self.layers[i].load_ref_state_dict(block_state)
+        self.ln_final.weights.data = state["ln_final.weight"]
+        self.lm_head.W.data = state["lm_head.weight"]
+
+
+class CrossEntropyLoss(nn.Module):
+    """对 logits 与 target 索引计算平均交叉熵（数值稳定的 log-sum-exp）。"""
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        batch_size = inputs.shape[0]
+        line_max = inputs.max(dim=1, keepdim=True).values
+        exp_sum = (inputs - line_max).exp().sum(dim=1).log()
+        log_sum_exp = exp_sum + line_max.squeeze(1)
+        target_logits = inputs[torch.arange(batch_size, device=inputs.device), targets]
+        return (log_sum_exp - target_logits).mean()
 
 
 
