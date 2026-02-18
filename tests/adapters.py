@@ -25,6 +25,7 @@ from tests.toolFun.transformer import (
     TransformerBlock,
     TransformerLM,
     CrossEntropyLoss,
+    SoftMax
 )
 from tests.toolFun.Optimizer import Adamw,Cosine,GradientClip
 from tests.toolFun.dataLord import get_batch,save_checkpoint,load_checkpoint
@@ -451,7 +452,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    soft_max = SoftMax()
+    return soft_max(in_features, dim)
 
 
 def run_cross_entropy(

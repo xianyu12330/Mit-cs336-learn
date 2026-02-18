@@ -21,9 +21,9 @@ def get_batch(
     #生成随机索引形状为 (B,) 的索引数组在 [0, len(x) - context_length - 1] 范围内生成 batch_size 个随机整数
     rand_idx = torch.randint(0,max_idx_ + 1,(batch_size,))
 
-    #堆叠切片->Input row: 取 x[i : i + context_length],x[i + 1 : i + context_length + 1]
-    x = torch.stack([torch.from_numpy(numpy_x[i:i + context_length].astype(np.int64)) for i in  rand_idx]).to(device)
-    y = torch.stack([torch.from_numpy(numpy_x[i + 1 : i + context_length + 1].astype(np.int64)) for i in rand_idx]).to(device)
+    # 堆叠切片；rand_idx 为 tensor，索引 numpy 需用 int，故用 i.item()
+    x = torch.stack([torch.from_numpy(numpy_x[i.item() : i.item() + context_length].astype(np.int64)) for i in rand_idx]).to(device)
+    y = torch.stack([torch.from_numpy(numpy_x[i.item() + 1 : i.item() + context_length + 1].astype(np.int64)) for i in rand_idx]).to(device)
 
     return x,y
 #保存模型参数

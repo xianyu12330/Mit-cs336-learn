@@ -124,13 +124,30 @@ class BPETokenizer:
                 idx = int(key)
                 token = value
             else:
-                raise ValueError(f"无法解析的 vocab 格式: 键={k}, 值={v}")
+                raise ValueError(f"无法解析的 vocab 格式: 键={key}, 值={value}")
 
-            vocab[token] = idx  # 确保你在内存中存的是 Token -> ID 的映射
-        #第二步：解析 Merges 文件 (Text -> List)
-        #打开文件，按行读取
+            vocab[token] = idx  # 此处为 Token -> ID（解析用）
+        # __init__ 需要 vocab: dict[int, bytes]（id -> bytes），故转为 id -> bytes
+        id_to_bytes = {}
+        for token, idx in vocab.items():
+            if isinstance(token, str):
+                id_to_bytes[idx] = token.encode("utf-8")
+            elif isinstance(token, bytes):
+                id_to_bytes[idx] = token
+            else:
+                id_to_bytes[idx] = bytes([token]) if isinstance(token, int) else token.encode("utf-8")
+        # 确保 0–255 每个单字节都在词表中（encode 时会对 UTF-8 字节查表）
+        existing_bytes = set(id_to_bytes.values())
+        next_id = max(id_to_bytes.keys()) + 1 if id_to_bytes else 0
+        for b in range(256):
+            bb = bytes([b])
+            if bb not in existing_bytes:
+                id_to_bytes[next_id] = bb
+                existing_bytes.add(bb)
+                next_id += 1
+        # 第二步：解析 Merges 文件 (Text -> List)
         merge = []
-        with open(merges_filepath,'r',encoding='utf-8') as f:
+        with open(merges_filepath, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()#移除字符串开头和结尾的空白字符
                 #跳过注释或者空行
@@ -139,10 +156,10 @@ class BPETokenizer:
                 #分割字符串
                 parts = line.split()
                 if len(parts) == 2:
-                    token1 = parts[0].encode('utf-8')
-                    token2 = parts[1].encode('utf-8')
+                    token1 = parts[0].encode("utf-8")
+                    token2 = parts[1].encode("utf-8")
                     merge.append((token1, token2))
-        return cls(vocab, merge, special_tokens)
+        return cls(id_to_bytes, merge, special_tokens)
 
     def bpe_(self, ids: list[int]) -> list[int]:
         """

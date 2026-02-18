@@ -1,5 +1,6 @@
 
 import torch
+from sympy import false
 from torch import nn
 
 
@@ -222,7 +223,6 @@ class MultiHeadAttention(nn.Module):
         out = out.reshape(B,T,self.d_model)
         return out @ self.out_proj
 
-
 class MultiHeadAttentionWithRoPE(nn.Module):
     """带 RoPE 的多头自注意力，对应 adapters.run_multihead_self_attention_with_rope 的逻辑。"""
 
@@ -265,7 +265,6 @@ class MultiHeadAttentionWithRoPE(nn.Module):
         self.v_proj.W.data = state["attn.v_proj.weight"].clone()
         self.output_proj.W.data = state["attn.output_proj.weight"].clone()
 
-
 class TransformerBlock(nn.Module):
     """预归一化 Transformer 块：ln1 -> MHA+RoPE -> 残差 -> ln2 -> SwiGLU -> 残差。"""
 
@@ -294,7 +293,6 @@ class TransformerBlock(nn.Module):
         self.ffn.W1.data = state["ffn.w1.weight"].clone()
         self.ffn.W2.data = state["ffn.w2.weight"].clone()
         self.ffn.W3.data = state["ffn.w3.weight"].clone()
-
 
 class TransformerLM(nn.Module):
     """Transformer 语言模型：embedding -> N × TransformerBlock -> ln_final -> lm_head。"""
@@ -342,7 +340,6 @@ class TransformerLM(nn.Module):
         self.ln_final.weights.data = state["ln_final.weight"]
         self.lm_head.W.data = state["lm_head.weight"]
 
-
 class CrossEntropyLoss(nn.Module):
     """对 logits 与 target 索引计算平均交叉熵（数值稳定的 log-sum-exp）。"""
 
@@ -353,6 +350,44 @@ class CrossEntropyLoss(nn.Module):
         log_sum_exp = exp_sum + line_max.squeeze(1)
         target_logits = inputs[torch.arange(batch_size, device=inputs.device), targets]
         return (log_sum_exp - target_logits).mean()
+
+class SoftMax(nn.Module):
+    def forward(self, inputs: torch.Tensor,dim:int = -1) -> torch.Tensor:
+       #使用 keepdim=True 防止后续广播出错
+        line_max = inputs.max(dim=dim, keepdim=True).values
+        # 减去最大值（这一步很安全，不会改变 Softmax 的结果）
+        curr_feature = inputs - line_max
+        exp_feature = curr_feature.exp()
+        #求和
+        sum_exp_feature = exp_feature.sum(dim=dim, keepdim=True)
+        #归一化
+        return exp_feature / sum_exp_feature
+
+#top-p过滤逻辑
+class TopP(nn.Module):
+    def top_p_filter(self,logits:torch.Tensor,p:float) -> torch.Tensor:
+        #对词表分值进行降序排序
+        sort_logits,sort_idx = torch.sort(logits,dim=-1,descending=True)
+        soft_ = SoftMax()
+        #计算累计的概率分布,每个对应位置以及之前的总和如[0.65, 0.24, 0.11] -》[0.65, 0.89, 1.00
+        cumulative_probs = torch.cumsum(soft_.forward(sort_logits,dim=-1),dim=-1)
+        #创建掩码，去掉累计超过p的token
+        #把所有超过p的位置标记为true
+        sort_idx_remove = cumulative_probs > p
+        #确保至少保留第一个词（最高概率），并且我们要保留第一个“使概率超过 p”的那个词。做法是把标记位向右移动一格。
+        sort_idx_remove[...,1:] = sort_idx_remove[...,:-1].clone()
+        sort_idx_remove[...,0] = false
+
+        #被移除的token设置为负无穷
+        #将sort_idx_remove中的值，按照sort_idx指定的位置，放回原始顺序的位置上
+        #例 [A, B, C]-》[False, True, True]
+        idx_to_remove = sort_idx_remove.scatter(1,sort_idx,sort_idx_remove)
+        #[2.0, -inf, -inf]  # 只保留A，屏蔽B和C
+        logits = logits.masked_fill_(idx_to_remove,float("-inf"))
+        return logits
+
+            
+
 
 
 
